@@ -1,0 +1,240 @@
+# 放进 fork 仓库的 .github/workflows/auto-fix390.yml
+# 作用：每 30 分钟检查 upstream 的 fix/3.9.0 是否有新提交；有新提交时自动编译
+#       Windows x64 三个服务端 exe，并发布到固定 tag `latest-fix390`（prerelease）。
+# 固定 tag 让本地更新脚本始终从同一个 URL 取包，无需每次找最新 release。
+#
+# 额外附带两个引擎补丁（与 hotupdate/apply_engine_target_patch.py 完全一致，
+# 内联以免依赖第二个 checkout）：
+#   A 目标码 237/238/239：精确还原空脑袋【你也尝尝】「选中队友 + 其后方
+#     1/2/3 名队友」语义（目标是己方，不是敌方；3 主位 + 1 替补最多 4 单位，
+#     故三个星级须分别取 2/3/4 个单位）。upstream 未实现这三个码，放卡会断连。
+#   B 替补上场后 act_point 少一张：AP 回合快照读的是尚未同步替补的 Fight 名单，
+#     改为先投影当前 roster 到局部副本再计算。
+# 若上游日后自行实现了 237/238/239，会自动跳过补丁 A；补丁 B 独立应用。
+# 两个补丁的锚点均已在当前 fix/3.9.0 源码上验证唯一。
+#
+# 前置：fork 的 Settings -> Actions -> General -> Workflow permissions 设为 Read and write。
+# 手动跑一次：Actions -> Auto build fix/3.9.0 -> Run workflow。
+
+name: Auto build fix/3.9.0
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-fix390
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.cmp.outputs.changed }}
+      sha: ${{ steps.up.outputs.sha }}
+    steps:
+      - name: Read upstream fix/3.9.0 head
+        id: up
+        run: |
+          SHA=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/yoncodes/enigma/commits/fix/3.9.0 | jq -r .sha)
+          test "${#SHA}" -eq 40
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream head: $SHA"
+
+      - name: Compare against last published build
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(gh api "repos/${{ github.repository }}/releases/tags/latest-fix390" --jq .body 2>/dev/null || true)
+          LAST=$(printf '%s' "$BODY" | grep -o 'commit:[0-9a-f]\{40\}' | head -1 | cut -d: -f2 || true)
+          echo "last built: ${LAST:-none}"
+          if [ "${{ steps.up.outputs.sha }}" != "$LAST" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream fix/3.9.0
+        uses: actions/checkout@v4
+        with:
+          repository: yoncodes/enigma
+          ref: fix/3.9.0
+
+      - name: Setup Python (engine patch)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # upstream 只实现了 91 个目标码，237/238/239 会触发 MalformedTarget 并断连。
+      # 这里给战斗引擎补上「选中队友 + 后方 N 名队友」规则（pool.allies，含替补）。
+      # 幂等：上游已实现则跳过。
+      - name: Patch engine for target codes 237/238/239
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          p = os.path.join("battle", "src", "engine", "skill", "target", "resolve", "mod.rs")
+          s = open(p, encoding="utf-8", newline="").read()
+          if "SelectedWithBehind" in s or "237 => TargetRule::" in s:
+              print("upstream already implements 237/238/239, skip patch")
+              raise SystemExit(0)
+          E = []
+          E.append((
+              "    SelectedTarget,\n    PriorityEnemyWithMonsterLabel(i32),\n}",
+              "    SelectedTarget,\n    SelectedWithBehind(i32),\n    PriorityEnemyWithMonsterLabel(i32),\n}"))
+          E.append((
+              "            TargetRule::SelectedTarget => selected_target(pool, source_uid, context),\n",
+              "            TargetRule::SelectedTarget => selected_target(pool, source_uid, context),\n"
+              "            TargetRule::SelectedWithBehind(behind) => {\n"
+              "                let allies = pool.allies(source_uid);\n"
+              "                let start = allies\n"
+              "                    .iter()\n"
+              "                    .position(|entity| entity.uid == context.runtime_target_uid)\n"
+              "                    .unwrap_or(0);\n"
+              "                allies\n"
+              "                    .iter()\n"
+              "                    .skip(start)\n"
+              "                    .take(1 + behind.max(0) as usize)\n"
+              "                    .map(|entity| entity.uid)\n"
+              "                    .collect()\n"
+              "            }\n"))
+          E.append((
+              "        | TargetRule::AlliesWithoutStatus => Some(false),\n",
+              "        | TargetRule::AlliesWithoutStatus\n"
+              "        | TargetRule::SelectedWithBehind(_) => Some(false),\n"))
+          E.append((
+              "                | TargetRule::EnemiesIncludingSpecial\n        )\n",
+              "                | TargetRule::EnemiesIncludingSpecial\n                | TargetRule::SelectedWithBehind(_)\n        )\n"))
+          E.append((
+              "        1 => TargetRule::SelectedTarget,\n",
+              "        1 => TargetRule::SelectedTarget,\n"
+              "        237 => TargetRule::SelectedWithBehind(1),\n"
+              "        238 => TargetRule::SelectedWithBehind(2),\n"
+              "        239 => TargetRule::SelectedWithBehind(3),\n"))
+          for old, new in E:
+              if s.count(old) != 1:
+                  raise SystemExit("anchor mismatch, upstream source changed: " + old[:70])
+              s = s.replace(old, new, 1)
+          with open(p, "w", encoding="utf-8", newline="") as f:
+              f.write(s)
+          print("engine patched: 237/238/239 -> selected ally + behind 1/2/3")
+          PY
+
+      # 玩家队替补走 RuleOp::ImmediateReservePromotion -> promote_immediate_reserves()，
+      # 它只交换 EntityManager 的 roster lane，不 sync_entities()。回合结算 L542 的
+      # act_point 快照因此读到旧 Fight 名单（阵亡者 hp=0、替补不在名单）算出 2 张，
+      # 权威名单要到 L654 才写回，于是 3 人队伍整个下一回合都少一张可选卡。
+      - name: Patch next-round AP after immediate reserve promotion
+        id: appatch
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          p = os.path.join("battle", "src", "engine", "runtime", "round.rs")
+          s = open(p, encoding="utf-8", newline="").read()
+          status = "applied"
+          if "ap_fight" in s:
+              print("AP patch already applied, skip")
+              status = "already-applied"
+          else:
+              old = (
+                  "            // Snapshot next-round AP before lifecycle cleanup removes one-round\n"
+                  "            // modifiers that have already contributed to this value.\n"
+                  "            self.round_state.act_point = next_action_points(\n"
+                  "                &self.fight,\n")
+              new = (
+                  "            // Snapshot next-round AP before lifecycle cleanup removes one-round\n"
+                  "            // modifiers that have already contributed to this value.\n"
+                  "            // Immediate reserve promotions swap roster lanes without updating\n"
+                  "            // the Fight snapshot yet; project the live roster into a local copy\n"
+                  "            // so the next round is not one card short after a substitute enters.\n"
+                  "            let mut ap_fight = self.fight.clone();\n"
+                  "            self.managers.sync_entities(&mut ap_fight);\n"
+                  "            self.round_state.act_point = next_action_points(\n"
+                  "                &ap_fight,\n")
+              if s.count(old) != 1:
+                  print("::warning::AP snapshot anchor missing or not unique; upstream source changed, skipping optional AP patch")
+                  status = "SKIPPED-anchor-mismatch"
+              else:
+                  with open(p, "w", encoding="utf-8", newline="") as f:
+                      f.write(s.replace(old, new, 1))
+                  print("AP patch applied to", p)
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, "a", encoding="utf-8") as f:
+                  f.write("status=" + status + "\n")
+          PY
+
+      - name: Clone matching sonetto-data
+        shell: bash
+        run: git clone --depth 1 https://gitlab.com/yoncodes/sonetto-data.git sonetto-data
+
+      - name: Prepare data
+        shell: bash
+        run: |
+          mkdir -p data
+          cp -r sonetto-data/excel2json data/
+
+      - name: Point config codegen at the data snapshot
+        shell: pwsh
+        run: |
+          $path = "${{ github.workspace }}\sonetto-data\excel2json"
+          echo "JSON_DATA_DIR=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-06
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: win-fix390-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: win-fix390-
+
+      - name: Build servers
+        run: cargo build --release -p gameserver -p sdkserver -p muipserver
+
+      # 故意不打包 config.toml：本机那份有自定义存档路径、skip_tutorial 和 activity schedule，
+      # 覆盖会导致连不上数据库。
+      - name: Package
+        shell: cmd
+        run: |
+          mkdir artifacts\data
+          copy target\release\gameserver.exe artifacts\
+          copy target\release\sdkserver.exe artifacts\
+          copy target\release\muipserver.exe artifacts\
+          xcopy /E /I data\excel2json artifacts\data\excel2json
+          cd artifacts
+          tar -czf ..\enigma-windows.tar.gz gameserver.exe sdkserver.exe muipserver.exe data
+
+      - name: Publish to the fixed tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          gh release view latest-fix390 >/dev/null 2>&1 \
+            || gh release create latest-fix390 --prerelease --title "fix/3.9.0 auto build" --notes "init"
+          gh release upload latest-fix390 enigma-windows.tar.gz --clobber
+          gh release edit latest-fix390 \
+            --title "fix/3.9.0 auto build ($SHA)" \
+            --notes "commit:$SHA
+          patches: target-codes-237/238/239 + reserve-ap=${{ steps.appatch.outputs.status }}
+          upstream: https://github.com/yoncodes/enigma/tree/fix/3.9.0
+          built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
