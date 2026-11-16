@@ -227,12 +227,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           SHA: ${{ needs.check.outputs.sha }}
         run: |
-          gh release view latest-fix390 >/dev/null 2>&1 \
-            || gh release create latest-fix390 --prerelease --title "fix/3.9.0 auto build" --notes "init"
-          gh release upload latest-fix390 enigma-windows.tar.gz --clobber
-          gh release edit latest-fix390 \
+          # Checkout 拉的是 upstream 仓库，git remote 指向 yoncodes/enigma。
+          # gh 默认从 remote 推断仓库，会误操作 upstream（fork 的 token 无写权限 -> 403）。
+          # 必须显式 --repo 指向自己的 fork。不要用 --target：upstream 新 commit
+          # 未必存在于 fork；release 只需托管资产，SHA 记录在 body 里即可。
+          gh release view latest-fix390 --repo "$GH_REPO" >/dev/null 2>&1 \
+            || gh release create latest-fix390 --repo "$GH_REPO" --prerelease \
+                 --title "fix/3.9.0 auto build" --notes "init"
+          gh release upload latest-fix390 enigma-windows.tar.gz --clobber --repo "$GH_REPO"
+          gh release edit latest-fix390 --repo "$GH_REPO" \
             --title "fix/3.9.0 auto build ($SHA)" \
             --notes "commit:$SHA
           patches: target-codes-237/238/239 + reserve-ap=${{ steps.appatch.outputs.status }}
