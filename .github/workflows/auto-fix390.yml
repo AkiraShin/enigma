@@ -85,7 +85,7 @@ jobs:
           python - <<'PY'
           import os
           p = os.path.join("battle", "src", "engine", "skill", "target", "resolve", "mod.rs")
-          s = open(p, encoding="utf-8", newline="").read()
+          s = open(p, encoding="utf-8").read()   # Windows runner 会把 LF 转成 CRLF；用通用换行读入再按 \n 匹配锚点
           if "SelectedWithBehind" in s or "237 => TargetRule::" in s:
               print("upstream already implements 237/238/239, skip patch")
               raise SystemExit(0)
@@ -142,7 +142,7 @@ jobs:
           python - <<'PY'
           import os
           p = os.path.join("battle", "src", "engine", "runtime", "round.rs")
-          s = open(p, encoding="utf-8", newline="").read()
+          s = open(p, encoding="utf-8").read()   # Windows runner 会把 LF 转成 CRLF；用通用换行读入再按 \n 匹配锚点
           status = "applied"
           if "ap_fight" in s:
               print("AP patch already applied, skip")
