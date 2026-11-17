@@ -44,12 +44,19 @@ jobs:
     steps:
       - name: Read upstream fix/3.9.0 head
         id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 未鉴权调用会被共享 runner IP 限流（403），一律带 token；仍失败则退化为空 SHA。
           SHA=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
-            https://api.github.com/repos/yoncodes/enigma/commits/fix/3.9.0 | jq -r .sha)
-          test "${#SHA}" -eq 40
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/yoncodes/enigma/commits/fix/3.9.0 | jq -r .sha || true)
+          if [ "${#SHA}" -ne 40 ]; then
+            echo "::warning::上游 SHA 读取失败（限流或网络），退化为空；是否构建由 force 输入决定"
+            SHA=""
+          fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "upstream head: $SHA"
+          echo "upstream head: ${SHA:-<unavailable>}"
 
       - name: Compare against last published build
         id: cmp
